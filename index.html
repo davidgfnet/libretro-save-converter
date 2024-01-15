@@ -1,0 +1,429 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>SRM savegame converter</title>
+    <style>
+      body {
+        background-color: #606090;
+        color: #eeeeee;
+        font-family: "Hind", Sans-Serif;
+        font-weight: none;
+      }
+      h1 {
+        font-weight: bold;
+        text-align: center;
+        padding-top: 60px;
+        padding-bottom: 20px;
+      }
+      .cbox {
+        width: 70%;
+        margin-left: 15%;
+        padding: 20px;
+        text-align: center;
+        border: 2px;
+        border-style: solid;
+        border-color: #ccc;
+        border-radius: 10px;
+        background-color: #8888b9;
+      }
+      .pright {
+        text-align: right;
+      }
+      button {
+        border-radius: 6px;  
+        border: 3px solid #bbd;
+        padding: 10px;
+        min-width: 150px;
+        background-color: #505080;
+        color: #fff;
+        font-weight: 600;
+      }
+      .hidden {
+        display: none;
+      }
+
+      /* Switch CSS */
+      .switch {
+        position: relative;
+        display: inline-block;
+        width: 40px;
+        height: 19px;
+      }
+      .switch input {
+        opacity: 0;
+        width: 0;
+        height: 0;
+      }
+      .slider {
+        position: absolute;
+        cursor: pointer;
+        top: 0;
+        left: 0;
+        right: 0;
+        bottom: 0;
+        background-color: #ccc;
+        transition: .4s;
+        border-radius: 17px;
+      }
+      .slider:before {
+        position: absolute;
+        content: "";
+        height: 15px;
+        width: 15px;
+        left: 2px;
+        bottom: 2px;
+        background-color: white;
+        transition: .4s;
+        border-radius: 50%;
+      }
+      a {
+        text-decoration: none;
+        font-weight: bold;
+        color: #627;
+      }
+      .footer {
+        width: 70%;
+        text-align: right;
+        margin-left: 15%;
+        margin-right: 15%;
+        margin-top: 10px;
+      }
+
+      input:checked + .slider {
+        background-color: #CF66F4;
+      }
+      input:focus + .slider {
+        box-shadow: 0 0 1px #2196F3;
+      }
+      input:checked + .slider:before {
+        transform: translateX(20px);
+      }
+      
+    </style>
+    <link href="https://fonts.googleapis.com/css?family=Hind" rel="stylesheet">
+    <script type="text/javascript" src="pako.min.js"></script>
+    <script type="text/javascript">
+      /* Copyright 2023 David Guillen Fandos <david@davidgf.net> */
+
+      var rzipsig = new Uint8Array([35,82,90,73,80,118,1,35]); /* #RZIPv\1# */
+      var rastsig = new Uint8Array([82,65,83,84,65,84,69,1]); /* RASTATE\1 */
+      var memblksig = new Uint8Array([77,69,77,32]); /* "MEM " */
+      var endblksig = new Uint8Array([69,78,68, 0]); /* "END " */
+
+      const statefilerex = new RegExp(".*\\.state[0-9]*$");
+      const savefilerex = new RegExp(".*\\.(sav|srm)$");
+
+      function rzip_decomp(buf) {
+        var chunk_size = (new DataView(buf.slice( 8, 12).buffer, 0)).getUint32(0, true);
+        var total_size = (new DataView(buf.slice(12, 20).buffer, 0)).getBigUint64(0, true);
+        console.log("Reading Rzip file, with chunk size " + chunk_size + " and total size " + total_size);
+        var contents = buf.slice(20);
+        var ret = new Uint8Array();
+        while (contents.length > 0) {
+          var bsize = (new DataView(contents.slice(0, 4).buffer, 0)).getUint32(0, true);
+          var compchunk = contents.slice(4, 4+bsize);
+          var rchunk = pako.inflate(compchunk);
+          ret = new Uint8Array([...ret, ...rchunk])
+          contents = contents.slice(bsize + 4);   // Skip this block
+        }
+        return ret;
+      }
+
+      function ra1_memext(buf) {
+        // Find the "MEM " block, ignore the other ones
+        buf = buf.slice(8);
+        while (buf.length) {
+          var bsize = (new DataView(buf.slice(4, 8).buffer, 0)).getUint32(0, true);
+          if (sigmatch(buf, memblksig))
+            return buf.slice(8, 8+bsize);
+
+          var skipsz = 8 + ((bsize + 7) & ~7);
+          buf = buf.slice(skipsz);
+        }
+        return null;
+      }
+      function basename(fn) {
+        return fn.split(".").reverse().splice(1).reverse().join(".");
+      }
+      function le32(num) {
+        // Serialize a little endian 32 bit integer.
+        return new Uint8Array([
+          (num >>  0) & 0xFF,
+          (num >>  8) & 0xFF,
+          (num >> 16) & 0xFF,
+          (num >> 24) & 0xFF,
+        ]);
+      }
+      function rastate1(buf) {
+        // Generate a RASTATEv1 from a raw savestate.
+        var zerole32 = le32(0);
+        var memsize = le32(buf.length);
+        // The buffer must be 8 byte padded with zeros!
+        var padlen = (8 - (buf.length & 7)) & 7;
+        var padding = new Uint8Array(padlen);
+        return new Uint8Array([
+          ...rastsig, ...memblksig, ...memsize,
+          ...buf, ...padding, ...endblksig, ...zerole32]);
+      }
+      function rzipcomp(buf) {
+        // Compresses a buffer using rzip (default config).
+        var allser = new Uint8Array([]);
+        var chunksize = 131072;
+        for (var off = 0; off < buf.length; off += chunksize) {
+          var c = buf.slice(off, off + chunksize);
+          var comp = pako.deflate(c);
+          var chsz = le32(c.length);
+          allser = new Uint8Array([...allser, ...chsz, ...comp]);
+        }
+        // Write the headers and chunks.
+        var totalsz_lo = le32(buf.length);  // Maximum 32GB :P
+        var totalsz_hi = le32(0);
+        var chsizeinfo = le32(chunksize);
+        return new Uint8Array([
+          ...rzipsig, ...chsizeinfo, ...totalsz_lo,
+          ...totalsz_hi, ...allser]);
+      }
+
+      function sigmatch(buf, signature) {
+        for (var i = 0; i < signature.length; i++) {
+          if (buf[i] != signature[i])
+            return false;
+        }
+        return true;
+      }
+      // Returns the file type (guesses)
+      function processfile(filename, buf) {
+        if (buf.length < 24)
+          return {"type": "err", "msg": "File doesn't seem to be a valid savefile nor savestate"};
+        else if (sigmatch(buf, rzipsig)) {
+          // Rzip files can contain a state or a savegame.
+          var buf = rzip_decomp(buf);
+          if (sigmatch(buf, rastsig)) {
+            return {
+              "type": "rzip_savestate_v1", "msg": "Retroarch v1 savestate (RZIP compressed)",
+              "content": ra1_memext(buf),
+            };
+          }
+          else {
+            // Compressed raw content. Can be an old savestate or a regular savegame.
+            // Guess using filename.
+            if (statefilerex.exec(filename)) {
+              return {
+                "type": "rzip_savestate_v0", "msg": "Retroarch RZIP compressed savestate (guess)",
+                "content": buf,
+              };
+            }
+
+            return {
+              "type": "rzip_savegame", "msg": "Retroarch RZIP compressed savegame (guess)",
+              "content": buf,
+            };
+          }
+        }
+        else if (sigmatch(buf, rastsig)) {
+          // An uncompressed RAv1 savestate.
+          return {
+            "type": "savestate_v1", "msg": "Retroarch v1 savestate",
+            "content": ra1_memext(buf),
+          };
+        }
+        else {
+          // Try to guess by filename?
+          if (statefilerex.exec(filename)) {
+            return {
+              "type": "savestate_v0_guess", "msg": "Uncompressed statefile (guess)",
+              "content": buf,
+            };
+          }
+          else if (savefilerex.exec(filename)) {
+            return {
+              "type": "savegame_uncomp_guess", "msg": "Uncompressed savegame (guess)",
+              "content": buf,
+            };
+          }
+          else {
+            return {
+              "type": "unknown_uncompressed", "msg": "Uncompressed statefile or savegame (can't guess)",
+              "content": buf,
+            };
+          }
+        }
+      }
+      function updateUI(fn, ident) {
+        hideopt("savestate-raw-easy");
+        hideopt("savegame-raw-easy");
+        hideopt("info-easy");
+        hideopt("savestate-raw");
+        hideopt("savestate-v1-rzip");
+        hideopt("savegame-raw");
+        hideopt("savegame-rzip");
+        hideopt("info-pro");
+
+        if (ident["type"] == "rzip_savestate_v1" ||
+            ident["type"] == "rzip_savestate_v0" ||
+            ident["type"] == "savestate_v1") {
+          // Convert to raw savestate
+          var rawfn = basename(fn) + ".state";
+          var zipfn = basename(fn) + ".srm";
+          document.getElementById("ftype").innerHTML = ident["msg"];
+          showoptbut("savestate-raw-easy", rawfn, ident["content"]);
+          showoptbut("savestate-raw",      rawfn, ident["content"]);
+          showoptbut("savestate-v1-rzip",  zipfn, rzipcomp(rastate1(ident["content"])));
+       }
+       else if (ident["type"] == "rzip_savegame") {
+          // Convert to raw savegame
+          var rawfn = basename(fn) + ".sav";
+          var cmpfn = basename(fn) + ".srm";
+          document.getElementById("ftype").innerHTML = ident["msg"];
+          showoptbut("savegame-raw-easy", rawfn, ident["content"]);
+          showoptbut("savegame-raw",      rawfn, ident["content"]);
+          showoptbut("savegame-rzip",     cmpfn, rzipcomp(ident["content"]));
+       }
+       else if (ident["type"] == "savegame_uncomp_guess") {
+          document.getElementById("ftype").innerHTML = ident["msg"];
+          showopt("info-easy");
+          var cmpfn = basename(fn) + ".srm";
+          showoptbut("savegame-rzip", cmpfn, rzipcomp(ident["content"]));
+       }
+       else if (ident["type"] == "savestate_v0_guess") {
+          document.getElementById("ftype").innerHTML = ident["msg"];
+          showopt("info-easy");
+          var zipfn = basename(fn) + ".srm";
+          showoptbut("savestate-v1-rzip",  zipfn, rzipcomp(rastate1(ident["content"])));
+       }
+       else {
+          document.getElementById("ftype").innerHTML = ident["msg"];
+       }
+
+       // Default to easy mode
+       document.getElementById('promode').checked = false;
+       hideopt("but-expert");
+       showopt("but-easy");
+
+       hideopt("uploadbox");
+       showopt("downbox");
+      }
+      function readfile(e) {
+        var file = e.target.files[0];
+        if (!file) {
+          return;
+        }
+        var reader = new FileReader();
+        reader.onload = function(e) {
+          var contents = e.target.result;
+          var ident = processfile(file.name, new Uint8Array(contents));
+          updateUI(file.name, ident);
+          console.log(ident);
+        };
+        reader.readAsArrayBuffer(file);
+      }
+      function a2e(a) {
+        for (var j = 0, r = ""; j < a.length; j++)
+          r += '%' + ("0" + a[j].toString(16)).slice(-2);
+        return r;
+      }
+      function download(filename, data) {
+        var element = document.createElement('a');
+        element.setAttribute('href', 'data:application/octet-stream,' + a2e(data));
+        element.setAttribute('download', filename);
+        element.style.display = 'none';
+        document.body.appendChild(element);
+        element.click();
+        document.body.removeChild(element);
+      }
+      function hideopt(ename) {
+        document.getElementById(ename).classList.add("hidden");
+      }
+      function showopt(ename) {
+        document.getElementById(ename).classList.remove("hidden");
+      }
+      function showoptbut(ename, fn, downcont) {
+        showopt(ename);
+        console.log(downcont);
+         document.getElementById(ename + "-b").addEventListener("click", function() {
+           download(fn, downcont);
+         });
+      }
+      function modechange() {
+        if (document.getElementById('promode').checked) {
+           showopt("but-expert");
+           hideopt("but-easy");
+        } else {
+           hideopt("but-expert");
+           showopt("but-easy");
+        }
+      }
+      document.addEventListener('DOMContentLoaded', function() {
+        // On file upload, read file and check it
+        document.getElementById('file-read')
+          .addEventListener('change', readfile, false);
+        document.getElementById('promode')
+          .addEventListener('change', modechange, false);
+      });
+    </script>
+  </head>
+  <body>
+    <h1>Retroarch / libretro SRM savegame/savestate converter</h1>
+    <div class="cbox" id="uploadbox">
+      <p>
+        Pick a file to upload. Accepted files are usually <i>.srm</i>, <i>.sav</i>, <i>.state</i> (<i>.state1</i>, <i>.state2</i>, ...)
+      </p>
+      <form>
+        <input type="file" id="file-read" />
+      </form>
+    </div>
+    <div class="cbox hidden" id="downbox">
+
+      <div class="pright">
+        <label>Expert mode &nbsp;</label>
+        <label class="switch">
+          <input type="checkbox" id="promode">
+          <span class="slider round"></span>
+        </label>
+      </div>
+
+      <p>
+        Uploaded file type: <b><span id="ftype"></span></b>
+      </p>
+      <div id="but-easy">
+        <div id="info-easy">
+          No conversions can be performed!
+        </div>
+        <div id="savestate-raw-easy">
+          <p>You can convert this savestate file to a <i>raw</i> savestate.
+          It might be possible to load it in a standalone emulator.</p>
+          <button id="savestate-raw-easy-b">Convert!</button>
+        </div>
+        <div id="savegame-raw-easy">
+          <p>You can convert this savegame file to a <i>raw</i> savegame.
+          It is usually possible to use it in a standalone emulator.</p>
+          <button id="savegame-raw-easy-b">Convert!</button>
+        </div>
+      </div>
+      <div id="but-expert">
+        <div id="info-pro">
+          No conversions can be performed!
+        </div>
+        <div id="savestate-raw">
+          <button id="savestate-raw-b">Convert to raw savestate file</button>
+          <p>Might be usable on a standalone emulator. It is also a valid legacy Retroarch format.</p>
+        </div>
+        <div id="savestate-v1-rzip">
+          <button id="savestate-v1-rzip-b">Convert to compressed v1 savestate file</button>
+          <p>Used in Retroarch, place it inside the <i>"states"</i> directory. The name depends on the slot number.</p>
+        </div>
+        <div id="savegame-raw">
+          <button id="savegame-raw-b">Convert to raw savegame file</button>
+          <p>Tipically used on standalone emulators. Can also be used in Retroarch as a .srm file</p>
+        </div>
+        <div id="savegame-rzip">
+          <button id="savegame-rzip-b">Convert to raw compressed savegame file</button>
+          <p>Used in Retroarch, as <i>.srm</i> file. Place it inside the <i>"saves"</i> directory</p>
+        </div>
+      </div>
+    </div>
+
+    <div class="footer">Created by <a href="https://github.com/davidgfnet/">davidgfnet</a></div>
+  </body>
+</html>
